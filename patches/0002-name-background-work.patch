@@ -1,0 +1,300 @@
+From f40fa069b4ce803cc2d73976b1ecde90f579bfdc Mon Sep 17 00:00:00 2001
+From: Guy <guy.xtafcusqt@gmail.com>
+Date: Tue, 6 Oct 2026 22:36:22 +0800
+Subject: [PATCH] fix(acp): name background subagents and shell jobs by their
+ description
+
+A subagent was reported as the bare kind "subagent" and a shell job by its raw
+command line, so the platform's background-work list could not tell two runs
+apart without opening each one.
+
+Subagents are now reported from the parent's subagent/catalog entry, which the
+manager appends once per in-process child before the run starts and which
+carries the delegating call's `description` as its label. Shell jobs are
+matched by owner and exact command to the still-open call that started them,
+and take that call's `description` as their name; the command line moves to
+the description so it stays visible.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ packages/acp/acp/src/background-tasks.ts      | 19 +++++
+ packages/acp/acp/src/index.ts                 | 54 +++++++++---
+ .../acp/acp/tests/background-tasks.spec.ts    | 84 +++++++++++++++++--
+ 3 files changed, 136 insertions(+), 21 deletions(-)
+
+diff --git a/packages/acp/acp/src/background-tasks.ts b/packages/acp/acp/src/background-tasks.ts
+index 512bf57..3e51e6d 100644
+--- a/packages/acp/acp/src/background-tasks.ts
++++ b/packages/acp/acp/src/background-tasks.ts
+@@ -153,3 +153,22 @@ function asRecord(value: unknown): Record<string, unknown> {
+     ? value as Record<string, unknown>
+     : {}
+ }
++
++/**
++ * Read the shell-call shape every shell tool shares: a command line plus the
++ * model's display description. Anything else is not a shell call.
++ * @param argumentsJson - the committed tool-call arguments.
++ * @returns the command and description, or undefined.
++ */
++export function shellCallArgs(argumentsJson: string): { command: string; description: string } | undefined {
++  let value: unknown
++  try {
++    value = JSON.parse(argumentsJson)
++  } catch {
++    return undefined
++  }
++  if (typeof value !== 'object' || value === null) return undefined
++  const { command, description } = value as Record<string, unknown>
++  if (typeof command !== 'string' || typeof description !== 'string' || description.trim() === '') return undefined
++  return { command, description: description.trim() }
++}
+diff --git a/packages/acp/acp/src/index.ts b/packages/acp/acp/src/index.ts
+index d45d385..cb8f305 100644
+--- a/packages/acp/acp/src/index.ts
++++ b/packages/acp/acp/src/index.ts
+@@ -57,6 +57,7 @@ import {
+   AIR_NATIVE_SUBAGENT_SESSIONS,
+   asyncTaskStateOf,
+   clientSupportsAir,
++  shellCallArgs,
+   subagentStateOf,
+   type AsyncTaskStopParams,
+ } from './background-tasks.ts'
+@@ -196,19 +197,20 @@ export function apply(ctx: Context, config: AcpConfig): void {
+   // bridge session whose badge it belongs to.
+   const subagentChildren = new Map<SessionId, SessionId>()
+ 
+-  ctx.on('session/created', (session) => {
+-    const parent = session.header.parentSession
+-    if (parent === undefined) return
+-    const record = sessions.get(parent)
+-    if (record === undefined) return
+-    subagentChildren.set(session.id, parent)
++  // The parent's catalog entry is the first fact that names a child: it is
++  // appended once per in-process child, before the run starts, and carries the
++  // delegating call's `description` as its label.
++  ctx.on('session/event', (session, event) => {
++    if (event.type !== 'subagent/catalog') return
++    const record = sessions.get(session.header.id)
++    if (record?.ownsSession(session) !== true) return
++    const { childId, label } = event.data
++    subagentChildren.set(childId, session.header.id)
+     if (!subagentNotifications) return
+     record.enqueueBackgroundWork({
+       sessionUpdate: 'subagent_spawned',
+-      subagentSessionId: session.id,
+-      // The harness subagent lifecycle carries no name or task at creation
+-      // time; the kind is the only honest label.
+-      name: 'subagent',
++      subagentSessionId: childId,
++      name: label || 'subagent',
+       task: '',
+       capabilities: {},
+     })
+@@ -227,6 +229,28 @@ export function apply(ctx: Context, config: AcpConfig): void {
+     })
+   })
+ 
++  // A shell job carries only its command line as label; the model's
++  // human-readable `description` lives on the call that started it. Calls are
++  // held from their tool/call to their tool/result, so a job registered in
++  // between is matched by owner and exact command.
++  const shellCalls = new Map<string, { readonly owner: string; readonly command: string; readonly description: string }>()
++  ctx.on('session/event', (session, event) => {
++    if (event.type === 'tool/call') {
++      const args = shellCallArgs(event.data.arguments)
++      if (args !== undefined) shellCalls.set(event.data.callId, { owner: session.header.id, ...args })
++    } else if (event.type === 'tool/result') {
++      shellCalls.delete(event.data.message.toolCallId)
++    }
++  })
++  const takeShellDescription = (owner: string, command: string): string | undefined => {
++    for (const [callId, call] of shellCalls) {
++      if (call.owner !== owner || call.command !== command) continue
++      shellCalls.delete(callId)
++      return call.description
++    }
++    return undefined
++  }
++
+   // The job registry is optional: a composition without background execution
+   // still loads this bridge. The read-only surface below is all we consume.
+   const jobs = ctx.get('jobs') as BackgroundJobRegistry | undefined
+@@ -242,18 +266,22 @@ export function apply(ctx: Context, config: AcpConfig): void {
+     // paired job as well would double the badge.
+     if (job.kind === 'subagent' || !asyncTaskNotifications) return
+     switch (event.type) {
+-      case 'registered':
++      case 'registered': {
+         reportedAsyncTasks.add(job.id)
++        const described = takeShellDescription(owner, job.label)
+         record.enqueueBackgroundWork({
+           sessionUpdate: 'async_task_spawned',
+           asyncTaskId: job.id,
+-          name: job.label,
++          // Lead with what the model said it is doing; the command line moves
++          // to the description so it stays visible.
++          name: described || job.label,
+           taskType: job.kind,
+-          description: job.progress ?? '',
++          description: job.progress ?? (described ? job.label : ''),
+           showInTranscript: false,
+           canStop: true,
+         })
+         return
++      }
+       case 'progress':
+         if (!reportedAsyncTasks.has(job.id)) return
+         record.enqueueBackgroundWork({
+diff --git a/packages/acp/acp/tests/background-tasks.spec.ts b/packages/acp/acp/tests/background-tasks.spec.ts
+index 7909073..420dbad 100644
+--- a/packages/acp/acp/tests/background-tasks.spec.ts
++++ b/packages/acp/acp/tests/background-tasks.spec.ts
+@@ -1,13 +1,15 @@
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
+ import type { Context } from '@deepseek-ai/cordis'
+-import type { Session } from '@deepseek-ai/dsh-session'
++import { ToolCallId } from '@deepseek-ai/dsh-llm'
++import { SessionId } from '@deepseek-ai/dsh-session'
+ import {
+   AIR_ASYNC_TASKS,
+   AIR_NATIVE_SUBAGENT_SESSIONS,
+   asyncTaskStateOf,
+   backgroundWorkNotification,
+   clientSupportsAir,
++  shellCallArgs,
+   subagentStateOf,
+ } from '../src/background-tasks.ts'
+ import { makeBridgeHarness, type BridgeHarness } from './harness.ts'
+@@ -29,10 +31,6 @@ function emit(ctx: Context, name: string, ...args: unknown[]): void {
+   (ctx.emit as unknown as (event: string, ...eventArgs: unknown[]) => void)(name, ...args)
+ }
+ 
+-/** A child-session stand-in; the bridge reads only its id and parent. */
+-function childSession(id: string, parent: string): Session {
+-  return { id, header: { parentSession: parent } } as unknown as Session
+-}
+ 
+ /** One job view as the bridge reads it. */
+ function job(overrides: Record<string, unknown>): Record<string, unknown> {
+@@ -55,6 +53,21 @@ describe('AIR background-work capability negotiation', () => {
+   })
+ })
+ 
++describe('shell call recognition', () => {
++  it('reads a command with its display description', () => {
++    expect(shellCallArgs('{"command":"sleep 999","description":" Wait for the build "}'))
++      .toEqual({ command: 'sleep 999', description: 'Wait for the build' })
++  })
++
++  it('rejects anything that is not a described shell call', () => {
++    expect(shellCallArgs('{"command":"sleep 999"}')).toBeUndefined()
++    expect(shellCallArgs('{"command":"sleep 999","description":"  "}')).toBeUndefined()
++    expect(shellCallArgs('{"path":"/tmp/a"}')).toBeUndefined()
++    expect(shellCallArgs('not json')).toBeUndefined()
++    expect(shellCallArgs('null')).toBeUndefined()
++  })
++})
++
+ describe('draft state mapping', () => {
+   it('maps every harness subagent outcome onto a draft terminal state', () => {
+     expect(subagentStateOf('completed')).toBe('completed')
+@@ -111,17 +124,39 @@ describe('background work reporting over the bridge', () => {
+     return sessionId
+   }
+ 
++  /** The bridge-owned session a test appends harness facts to. */
++  const bridgeSession = (sessionId: string) => harness!.ctx.agents.get(SessionId(sessionId))!.session
++
++  /** Append the parent-side catalog entry the subagent manager writes for one child. */
++  function catalogChild(sessionId: string, childId: string, label?: string): void {
++    bridgeSession(sessionId).append('subagent/catalog', {
++      version: 1,
++      childId: SessionId(childId),
++      childCreatedAt: 0,
++      mode: 'one-shot',
++      ...label === undefined ? {} : { label },
++    })
++  }
++
++  /** Append one committed tool call on the bridge session. */
++  function toolCall(sessionId: string, callId: string, args: Record<string, unknown>): void {
++    const session = bridgeSession(sessionId)
++    session.append('turn/start', { turn: 1 })
++    session.append('step/start', { turn: 1, step: 1 })
++    session.append('tool/call', { turn: 1, step: 1, callId: ToolCallId(callId), name: 'bash', arguments: JSON.stringify(args) })
++  }
++
+   it('reports a subagent lifecycle to a capable client', async () => {
+     const sessionId = await open()
+ 
+-    emit(harness!.ctx, 'session/created', childSession('child-1', sessionId))
++    catalogChild(sessionId, 'child-1', 'Audit the login flow')
+     await vi.waitFor(() => {
+       expect(raw()).toContainEqual({
+         sessionId,
+         update: {
+           sessionUpdate: 'subagent_spawned',
+           subagentSessionId: 'child-1',
+-          name: 'subagent',
++          name: 'Audit the login flow',
+           task: '',
+           capabilities: {},
+         },
+@@ -137,10 +172,21 @@ describe('background work reporting over the bridge', () => {
+     })
+   })
+ 
++  it('names an unlabelled subagent by its kind', async () => {
++    const sessionId = await open()
++
++    catalogChild(sessionId, 'child-2')
++    await vi.waitFor(() => {
++      expect(raw()).toContainEqual(expect.objectContaining({
++        update: expect.objectContaining({ sessionUpdate: 'subagent_spawned', subagentSessionId: 'child-2', name: 'subagent' }),
++      }))
++    })
++  })
++
+   it('stays silent for a client that did not negotiate the capability', async () => {
+     const sessionId = await open({ capabilities: {} })
+ 
+-    emit(harness!.ctx, 'session/created', childSession('child-9', sessionId))
++    catalogChild(sessionId, 'child-9', 'Audit the login flow')
+     emit(harness!.ctx, 'subagent/end', { id: 'child-9', runId: 'run-9', provider: 'spawn', local: true, stopReason: 'completed' })
+     await new Promise(resolve => setTimeout(resolve, 25))
+ 
+@@ -184,6 +230,28 @@ describe('background work reporting over the bridge', () => {
+     })
+   })
+ 
++  it('names a shell job by the description of the call that started it', async () => {
++    const sessionId = await open({ jobs: true })
++    toolCall(sessionId, 'call-1', { command: 'npm test', description: 'Run the unit tests', run_in_background: true })
++    toolCall(sessionId, 'call-2', { command: 'sleep 999', description: 'Wait for the deploy', run_in_background: true })
++
++    harness!.jobs!.emit({ type: 'registered', job: job({ owner: sessionId }) })
++    await vi.waitFor(() => {
++      expect(raw()).toContainEqual({
++        sessionId,
++        update: {
++          sessionUpdate: 'async_task_spawned',
++          asyncTaskId: 'bash-1',
++          name: 'Wait for the deploy',
++          taskType: 'bash',
++          description: 'sleep 999',
++          showInTranscript: false,
++          canStop: true,
++        },
++      })
++    })
++  })
++
+   it('does not double-report a background subagent job', async () => {
+     const sessionId = await open({ jobs: true })
+ 
+-- 
+2.54.0 (Apple Git-157)
+

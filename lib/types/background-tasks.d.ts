@@ -94,4 +94,14 @@ export declare function clientSupportsAir(capabilities: unknown, capability: str
 export declare function subagentStateOf(stopReason: string): SubagentState;
 /** Map a settled job's status onto the draft's terminal async-task state. */
 export declare function asyncTaskStateOf(status: string): AsyncTaskState;
+/**
+ * Read the shell-call shape every shell tool shares: a command line plus the
+ * model's display description. Anything else is not a shell call.
+ * @param argumentsJson - the committed tool-call arguments.
+ * @returns the command and description, or undefined.
+ */
+export declare function shellCallArgs(argumentsJson: string): {
+    command: string;
+    description: string;
+} | undefined;
 //# sourceMappingURL=background-tasks.d.ts.map
