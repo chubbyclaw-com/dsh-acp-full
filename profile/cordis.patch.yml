@@ -1,0 +1,15 @@
+# ChubbyClaw profile over the stock automation-only ACP application: keep every
+# bundled row, replace only the ACP bridge with the fork that also reports AIR
+# background work (subagents and detached jobs). The harness itself is stock
+# @deepseek-ai/dsh.
+
+- id: acp
+  disabled: true
+
+- insert:
+    - id: acp-full
+      name: '@chubbyclaw/dsh-acp-full'
+      inject: [acpAppStartup]
+      config:
+        provider: deepseek-official
+        model: deepseek-v4-flash

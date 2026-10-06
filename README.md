@@ -30,33 +30,38 @@ Everything is one structural cast away from the published SDK types, isolated in
 `src/background-tasks.ts`; when the draft ships in
 `@agentclientprotocol/sdk`, that file shrinks to nothing.
 
-## Install into a DSH profile
+## How it runs
 
-The plugin is a drop-in replacement for the `acp` row of the stock `acp`
-profile. Create a profile from the `acp` template and point the row at this
-package:
+The harness stays stock DeepSeek Harness. This package is only a **profile** for
+it, so the launch line still names the upstream binary:
 
 ```sh
-dsh fullacp --from-default-profile acp
-dsh plugin --profile fullacp add @chubbyclaw/dsh-acp-full   # or file:/path, or github:chubbyclaw-com/dsh-acp-full
+npx -y @deepseek-ai/dsh@0.2.1-alpha.1 --profile chubbyclaw-full-acp
 ```
 
-Then in `$DSH_HOME/profiles/fullacp/cordis.patch.yml`:
+The package ships both halves:
 
-```yaml
-- id: acp
-  disabled: true
+- `lib/` — the fork, a drop-in replacement for the stock `acp` bridge row;
+- `profile/` — the ready `chubbyclaw-full-acp` profile: it disables the stock
+  `acp` row and inserts this bridge, and declares which `dsh` runtime it targets
+  (`package.json` → `chubbyclaw.dshRuntimeVersion`).
 
-- insert:
-    - id: acp-full
-      name: '@chubbyclaw/dsh-acp-full'
-      inject: [acpAppStartup]
-      config:
-        provider: deepseek-official
-        model: deepseek-v4-flash
+`cclaw` prepares that profile for the owner with no pnpm, no clone and no extra
+install step: `npm pack @chubbyclaw/dsh-acp-full`, extract `lib/` into
+`$DSH_HOME/profiles/chubbyclaw-full-acp/node_modules/@chubbyclaw/dsh-acp-full/`
+and `profile/` into the profile root, then launch the pinned `dsh` above. The
+plugin's `@deepseek-ai/dsh-*` imports resolve to the harness installation, so no
+dependency tree is installed.
+
+## Manual install
+
+```sh
+npx -y @deepseek-ai/dsh@0.2.1-alpha.1 plugin --profile chubbyclaw-full-acp add @chubbyclaw/dsh-acp-full
 ```
 
-Boot it with `dsh --profile fullacp`.
+That uses pnpm and writes the same two halves; `profile/` is not applied by it,
+so copy `node_modules/@chubbyclaw/dsh-acp-full/profile/` over the profile root
+as well (or copy `profile/` first and let the loader resolve the package).
 
 ## Notes
 
