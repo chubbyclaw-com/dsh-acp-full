@@ -1,0 +1,967 @@
+From dbcec52ec1122de8f769a3fc51aebe68346f8c75 Mon Sep 17 00:00:00 2001
+From: Guy <guy.xtafcusqt@gmail.com>
+Date: Tue, 6 Oct 2026 11:29:09 +0800
+Subject: [PATCH] feat(acp): report subagents and detached jobs to AIR clients
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Emit the draft agent-client-protocol#1992 session updates — subagent_spawned,
+subagent_state_update, async_task_spawned, async_task_progress and
+async_task_state_update — plus the _session/async_task/stop extension request.
+
+Subagents come from the session/subagent lifecycle; detached jobs come from
+the ctx.jobs registry. Everything is gated on
+clientCapabilities._meta.jetbrains.air, so a client that does not negotiate
+the capability keeps exactly the standard ACP surface; this is what lets the
+platform surface and stop background work for DeepSeek Harness the way
+claude-agent-acp already does for Claude.
+
+The published @agentclientprotocol/sdk has no types for these variants, so
+they live behind one structural cast in src/background-tasks.ts. Tests assert
+on the raw wire, since the SDK client's strict schema drops them.
+---
+ packages/acp/acp/package.json                 |   5 +
+ packages/acp/acp/src/background-tasks.ts      | 155 +++++++++++++
+ packages/acp/acp/src/index.ts                 | 148 ++++++++++++-
+ packages/acp/acp/src/session.ts               |  19 ++
+ .../acp/acp/tests/background-tasks.spec.ts    | 207 ++++++++++++++++++
+ packages/acp/acp/tests/harness.ts             |  68 +++++-
+ packages/acp/acp/tsconfig.json                |   3 +
+ pnpm-lock.yaml                                |  43 ++--
+ 8 files changed, 626 insertions(+), 22 deletions(-)
+ create mode 100644 packages/acp/acp/src/background-tasks.ts
+ create mode 100644 packages/acp/acp/tests/background-tasks.spec.ts
+
+diff --git a/packages/acp/acp/package.json b/packages/acp/acp/package.json
+index a0d813352b..92846bce48 100644
+--- a/packages/acp/acp/package.json
++++ b/packages/acp/acp/package.json
+@@ -39,10 +39,14 @@
+     "@deepseek-ai/dsh-mcp-client": "workspace:*",
+     "@deepseek-ai/dsh-session": "workspace:*",
+     "@deepseek-ai/dsh-session-persistence": "workspace:*",
++    "@deepseek-ai/dsh-subagent": "workspace:*",
+     "@deepseek-ai/dsh-token-meter": "workspace:*",
+     "@deepseek-ai/dsh-user-approval": "workspace:*"
+   },
+   "peerDependenciesMeta": {
++    "@deepseek-ai/dsh-subagent": {
++      "optional": true
++    },
+     "@deepseek-ai/dsh-token-meter": {
+       "optional": true
+     }
+@@ -59,6 +63,7 @@
+     "@deepseek-ai/dsh-session-persistence": "workspace:*",
+     "@deepseek-ai/dsh-session-persistence-jsonl": "workspace:*",
+     "@deepseek-ai/dsh-session-projection": "workspace:*",
++    "@deepseek-ai/dsh-subagent": "workspace:*",
+     "@deepseek-ai/dsh-token-meter": "workspace:*",
+     "@deepseek-ai/dsh-tools": "workspace:*",
+     "@deepseek-ai/dsh-user-approval": "workspace:*"
+diff --git a/packages/acp/acp/src/background-tasks.ts b/packages/acp/acp/src/background-tasks.ts
+new file mode 100644
+index 0000000000..512bf576b0
+--- /dev/null
++++ b/packages/acp/acp/src/background-tasks.ts
+@@ -0,0 +1,155 @@
++/**
++ * AIR background-work extension: project the harness's subagent and detached-job
++ * lifecycle onto the ACP stream.
++ *
++ * The wire contract is the draft `agentclientprotocol/agent-client-protocol#1992`,
++ * which claude-agent-acp already implements. The published TypeScript SDK does
++ * not carry its types yet, so the compatibility boundary lives in this file:
++ * when the draft ships in the SDK, delete the local shapes and the one cast.
++ *
++ * Every update reaches only a client that negotiated the matching
++ * `_meta.jetbrains.air` capability during initialize. A client that does not
++ * advertise it sees exactly the standard ACP surface it saw before.
++ *
++ * @module @deepseek-ai/dsh-acp/background-tasks
++ */
++
++import type { SessionNotification } from '@agentclientprotocol/sdk'
++
++const AIR_META_NAMESPACE = 'jetbrains'
++const AIR_META_KEY = 'air'
++const AIR_META_VERSION = 1
++
++/** The `_meta.jetbrains.air` capabilities this bridge implements. */
++export const AIR_NATIVE_SUBAGENT_SESSIONS = 'nativeSubagentSessions'
++export const AIR_ASYNC_TASKS = 'asyncTasks'
++
++/** Params of the draft `_session/async_task/stop` extension request. */
++export type AsyncTaskStopParams = {
++  sessionId?: unknown
++  asyncTaskId?: unknown
++}
++
++/** Terminal subagent state, as the draft defines it. */
++export type SubagentState = 'completed' | 'failed' | 'cancelled' | 'disconnected'
++
++/** Async-task state; `running` and `paused` are live, the rest are terminal. */
++export type AsyncTaskState = 'running' | 'paused' | 'completed' | 'failed' | 'stopped'
++
++/** Announcement of one child session the harness started for a subagent. */
++export type SubagentSpawnedUpdate = {
++  sessionUpdate: 'subagent_spawned'
++  subagentSessionId: string
++  name: string
++  task: string
++  capabilities: { cancel?: boolean; close?: boolean }
++}
++
++/** Terminal transition of one subagent run. */
++export type SubagentStateUpdate = {
++  sessionUpdate: 'subagent_state_update'
++  subagentSessionId: string
++  state: SubagentState
++}
++
++/** Announcement of one detached background job. */
++export type AsyncTaskSpawnedUpdate = {
++  sessionUpdate: 'async_task_spawned'
++  asyncTaskId: string
++  name: string
++  taskType: string
++  description: string
++  showInTranscript: boolean
++  canStop: boolean
++}
++
++/** Progress narration of one detached background job. */
++export type AsyncTaskProgressUpdate = {
++  sessionUpdate: 'async_task_progress'
++  asyncTaskId: string
++  description?: string
++  lastToolName?: string
++}
++
++/** Terminal transition of one detached background job. */
++export type AsyncTaskStateUpdate = {
++  sessionUpdate: 'async_task_state_update'
++  asyncTaskId: string
++  state: AsyncTaskState
++}
++
++/** The draft update variants this bridge can project. */
++export type BackgroundWorkUpdate =
++  | SubagentSpawnedUpdate
++  | SubagentStateUpdate
++  | AsyncTaskSpawnedUpdate
++  | AsyncTaskProgressUpdate
++  | AsyncTaskStateUpdate
++
++/**
++ * Wrap one draft update as a standard session notification.
++ *
++ * This single structural cast stands in for the missing SDK types; the
++ * connection serializes the extra `sessionUpdate` variants verbatim.
++ * @param sessionId - the owning ACP session.
++ * @param update - the draft update to send.
++ * @returns the notification to hand the connection.
++ */
++export function backgroundWorkNotification(
++  sessionId: string,
++  update: BackgroundWorkUpdate,
++): SessionNotification {
++  return { sessionId, update } as unknown as SessionNotification
++}
++
++/**
++ * Whether the client advertised one capability through
++ * `clientCapabilities._meta.jetbrains.air`.
++ *
++ * Mirrors claude-agent-acp: the extension version must be an integer of at
++ * least 1 and the capability must appear in the advertised list. Anything
++ * else — an older client, another vendor, a malformed bag — is not capable.
++ * @param capabilities - the raw `clientCapabilities` from initialize.
++ * @param capability - one of {@link AIR_NATIVE_SUBAGENT_SESSIONS} or {@link AIR_ASYNC_TASKS}.
++ * @returns true only when the client declared that capability.
++ */
++export function clientSupportsAir(capabilities: unknown, capability: string): boolean {
++  const meta = asRecord(asRecord(capabilities)['_meta'])
++  const air = asRecord(asRecord(meta[AIR_META_NAMESPACE])[AIR_META_KEY])
++  const version = air['version']
++  const advertised = air['capabilities']
++  return typeof version === 'number'
++    && Number.isInteger(version)
++    && version >= AIR_META_VERSION
++    && Array.isArray(advertised)
++    && advertised.includes(capability)
++}
++
++/** Map a harness subagent stop reason onto the draft's terminal state. */
++export function subagentStateOf(stopReason: string): SubagentState {
++  switch (stopReason) {
++    case 'completed': return 'completed'
++    case 'aborted':
++    case 'interrupted': return 'cancelled'
++    case 'max-tokens':
++    case 'blocked':
++    case 'error': return 'failed'
++    default: return 'disconnected'
++  }
++}
++
++/** Map a settled job's status onto the draft's terminal async-task state. */
++export function asyncTaskStateOf(status: string): AsyncTaskState {
++  switch (status) {
++    case 'failed': return 'failed'
++    case 'killed': return 'stopped'
++    default: return 'completed'
++  }
++}
++
++/** Read one object-shaped value, treating every non-object as an empty bag. */
++function asRecord(value: unknown): Record<string, unknown> {
++  return value !== null && typeof value === 'object' && !Array.isArray(value)
++    ? value as Record<string, unknown>
++    : {}
++}
+diff --git a/packages/acp/acp/src/index.ts b/packages/acp/acp/src/index.ts
+index 44ef4741f1..d45d385954 100644
+--- a/packages/acp/acp/src/index.ts
++++ b/packages/acp/acp/src/index.ts
+@@ -48,8 +48,18 @@ import {
+ import type { ModelSelection } from '@deepseek-ai/dsh-agent'
+ import type { SessionId } from '@deepseek-ai/dsh-session'
+ import type {} from '@deepseek-ai/dsh-session-persistence'
++// Side-effect type import: brings the `subagent/end` event into the Context map.
++import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
+ // Side-effect type import: declaration-merges the approval waterfall answered below.
+ import type {} from '@deepseek-ai/dsh-user-approval'
++import {
++  AIR_ASYNC_TASKS,
++  AIR_NATIVE_SUBAGENT_SESSIONS,
++  asyncTaskStateOf,
++  clientSupportsAir,
++  subagentStateOf,
++  type AsyncTaskStopParams,
++} from './background-tasks.ts'
+ import { supportsAcpImagePrompts } from './content.ts'
+ import { AcpMcpConfigError } from './mcp.ts'
+ import { AcpModelConfigError } from './model-control.ts'
+@@ -57,6 +67,33 @@ import { AcpSession } from './session.ts'
+ 
+ const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
+ 
++/** Read-only projection of one background job, as the registry hands it out. */
++interface BackgroundJobView {
++  readonly id: string
++  readonly kind: string
++  readonly label: string
++  readonly owner?: string
++  readonly status: string
++  readonly progress?: string
++}
++
++/** One job-registry lifecycle event; only the fields this bridge reads. */
++type BackgroundJobEvent =
++  | { readonly type: 'registered' | 'progress' | 'stopping' | 'removed'; readonly job: BackgroundJobView }
++  | { readonly type: 'settled'; readonly job: BackgroundJobView }
++  | { readonly type: 'output'; readonly id: string; readonly owner?: string }
++
++/** The slice of `ctx.jobs` this bridge consumes, kept structural to avoid a hard dependency. */
++interface BackgroundJobRegistry {
++  readonly events: {
++    subscribe(
++      filter: { owners: 'all' },
++      listener: (event: BackgroundJobEvent) => void,
++    ): () => void
++  }
++  kill(id: string, caller?: string, reason?: string): 'requested' | 'already-finished'
++}
++
+ export const name = 'acp'
+ /** Core services required by the standard automation controls. */
+ export const inject = ['agents', 'llm', 'sessionPersistence', 'sessions']
+@@ -149,6 +186,96 @@ export function apply(ctx: Context, config: AcpConfig): void {
+     for (const record of sessions.values()) record.topologyChanged()
+   })
+ 
++  // ── Background work (draft AIR extension) ────────────────────────────────
++  //
++  // Subagents and detached jobs go only to a client that negotiated the
++  // matching capability in initialize; the two flags are set there.
++  let subagentNotifications = false
++  let asyncTaskNotifications = false
++  // Child session → delegating session, so one subagent/end can address the
++  // bridge session whose badge it belongs to.
++  const subagentChildren = new Map<SessionId, SessionId>()
++
++  ctx.on('session/created', (session) => {
++    const parent = session.header.parentSession
++    if (parent === undefined) return
++    const record = sessions.get(parent)
++    if (record === undefined) return
++    subagentChildren.set(session.id, parent)
++    if (!subagentNotifications) return
++    record.enqueueBackgroundWork({
++      sessionUpdate: 'subagent_spawned',
++      subagentSessionId: session.id,
++      // The harness subagent lifecycle carries no name or task at creation
++      // time; the kind is the only honest label.
++      name: 'subagent',
++      task: '',
++      capabilities: {},
++    })
++  })
++
++  ctx.on('subagent/end', (info: SubagentRunEndInfo) => {
++    const parent = subagentChildren.get(info.id)
++    if (parent === undefined) return
++    subagentChildren.delete(info.id)
++    const record = sessions.get(parent)
++    if (record === undefined || !subagentNotifications) return
++    record.enqueueBackgroundWork({
++      sessionUpdate: 'subagent_state_update',
++      subagentSessionId: info.id,
++      state: subagentStateOf(info.stopReason),
++    })
++  })
++
++  // The job registry is optional: a composition without background execution
++  // still loads this bridge. The read-only surface below is all we consume.
++  const jobs = ctx.get('jobs') as BackgroundJobRegistry | undefined
++  const reportedAsyncTasks = new Set<string>()
++  jobs?.events.subscribe({ owners: 'all' }, (event) => {
++    if (event.type === 'output') return
++    const { job } = event
++    const owner = job.owner
++    if (owner === undefined) return
++    const record = sessions.get(owner as SessionId)
++    if (record === undefined) return
++    // Background subagents report through their lifecycle above; counting the
++    // paired job as well would double the badge.
++    if (job.kind === 'subagent' || !asyncTaskNotifications) return
++    switch (event.type) {
++      case 'registered':
++        reportedAsyncTasks.add(job.id)
++        record.enqueueBackgroundWork({
++          sessionUpdate: 'async_task_spawned',
++          asyncTaskId: job.id,
++          name: job.label,
++          taskType: job.kind,
++          description: job.progress ?? '',
++          showInTranscript: false,
++          canStop: true,
++        })
++        return
++      case 'progress':
++        if (!reportedAsyncTasks.has(job.id)) return
++        record.enqueueBackgroundWork({
++          sessionUpdate: 'async_task_progress',
++          asyncTaskId: job.id,
++          ...(job.progress === undefined ? {} : { description: job.progress }),
++        })
++        return
++      case 'settled':
++      case 'removed':
++        if (!reportedAsyncTasks.delete(job.id)) return
++        record.enqueueBackgroundWork({
++          sessionUpdate: 'async_task_state_update',
++          asyncTaskId: job.id,
++          state: asyncTaskStateOf(job.status),
++        })
++        return
++      default:
++        return
++    }
++  })
++
+   // Permission requests are a machine policy channel for ACP clients such as
+   // dsh-subagent-acp. The bridge offers one-shot choices only and never infers a
+   // durable grant from an unknown client response.
+@@ -173,10 +300,12 @@ export function apply(ctx: Context, config: AcpConfig): void {
+   })
+ 
+   const implementation = {
+-    async initialize(_params: InitializeRequest): Promise<InitializeResponse> {
++    async initialize(params: InitializeRequest): Promise<InitializeResponse> {
+       // Single-version agent: the spec's "same version if supported, else
+       // the latest supported" both resolve to this server's one version.
+       imagePromptEnabled = await supportsAcpImagePrompts(ctx, config.provider, config.model)
++      subagentNotifications = clientSupportsAir(params.clientCapabilities, AIR_NATIVE_SUBAGENT_SESSIONS)
++      asyncTaskNotifications = clientSupportsAir(params.clientCapabilities, AIR_ASYNC_TASKS)
+       return {
+         protocolVersion: PROTOCOL_VERSION,
+         agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
+@@ -388,6 +517,23 @@ export function apply(ctx: Context, config: AcpConfig): void {
+     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
+     .onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))
+     .onNotification(methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
++    // Draft AIR extension (agent-client-protocol#1992): stop one detached job.
++    // The wire method is the one clients already call; settlement, not this
++    // call, retires the item from the client's list.
++    .onRequest(
++      '_session/async_task/stop',
++      (params: unknown): AsyncTaskStopParams => params as AsyncTaskStopParams,
++      ({ params }) => {
++        const sessionId = typeof params.sessionId === 'string' ? params.sessionId : ''
++        const taskId = typeof params.asyncTaskId === 'string' ? params.asyncTaskId : ''
++        if (sessions.get(sessionId as SessionId) === undefined) {
++          throw invalidParams(`unknown session: ${sessionId}`)
++        }
++        if (taskId === '') throw invalidParams('asyncTaskId is required')
++        jobs?.kill(taskId, sessionId, 'stopped by ACP client')
++        return {}
++      },
++    )
+   const connection = app.connect(stream)
+   const conn: AgentContext = connection.client
+ 
+diff --git a/packages/acp/acp/src/session.ts b/packages/acp/acp/src/session.ts
+index 3fff075359..7316135e2e 100644
+--- a/packages/acp/acp/src/session.ts
++++ b/packages/acp/acp/src/session.ts
+@@ -14,6 +14,7 @@ import type { Agent, AgentHandle, AgentOptions, ModelSelection } from '@deepseek
+ import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
+ import { type Session, type SessionEvent, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
+ import { AcpContentError, admitAcpPrompt } from './content.ts'
++import { backgroundWorkNotification, type BackgroundWorkUpdate } from './background-tasks.ts'
+ import { turnEndToStopReason } from './codec.ts'
+ import { mountAcpMcpServers } from './mcp.ts'
+ import { AcpModelControl } from './model-control.ts'
+@@ -233,6 +234,24 @@ export class AcpSession {
+     /* v8 ignore stop */
+   }
+ 
++  /**
++   * Enqueue one draft background-work update on this session's ordered output.
++   *
++   * Serialized behind every standard update so a subagent or job transition
++   * cannot overtake the output it belongs to.
++   * @param update - the draft update to send.
++   */
++  enqueueBackgroundWork(update: BackgroundWorkUpdate): void {
++    const previous = this.outputTail
++    this.outputTail = previous
++      .then(() => this.notify(backgroundWorkNotification(this.agent.session.id, update)))
++      /* v8 ignore start -- the bridge notifier contains transport rejection. */
++      .catch((error: unknown) => {
++        this.ctx.logger.warn(`acp: background-work update failed: ${errorChain(error)}`)
++      })
++    /* v8 ignore stop */
++  }
++
+   /**
+    * Admit, enqueue, and settle one prompt at whole-Agent quiescence.
+    * @param params - standard ACP prompt request for this session.
+diff --git a/packages/acp/acp/tests/background-tasks.spec.ts b/packages/acp/acp/tests/background-tasks.spec.ts
+new file mode 100644
+index 0000000000..7909073271
+--- /dev/null
++++ b/packages/acp/acp/tests/background-tasks.spec.ts
+@@ -0,0 +1,207 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
++import type { Context } from '@deepseek-ai/cordis'
++import type { Session } from '@deepseek-ai/dsh-session'
++import {
++  AIR_ASYNC_TASKS,
++  AIR_NATIVE_SUBAGENT_SESSIONS,
++  asyncTaskStateOf,
++  backgroundWorkNotification,
++  clientSupportsAir,
++  subagentStateOf,
++} from '../src/background-tasks.ts'
++import { makeBridgeHarness, type BridgeHarness } from './harness.ts'
++
++/** The `clientCapabilities` a capable platform sends: both draft capabilities. */
++const AIR_CAPABILITIES = {
++  _meta: {
++    jetbrains: {
++      air: {
++        version: 1,
++        capabilities: [AIR_NATIVE_SUBAGENT_SESSIONS, AIR_ASYNC_TASKS],
++      },
++    },
++  },
++}
++
++/** Emit one context event without fighting the branded lifecycle payloads. */
++function emit(ctx: Context, name: string, ...args: unknown[]): void {
++  (ctx.emit as unknown as (event: string, ...eventArgs: unknown[]) => void)(name, ...args)
++}
++
++/** A child-session stand-in; the bridge reads only its id and parent. */
++function childSession(id: string, parent: string): Session {
++  return { id, header: { parentSession: parent } } as unknown as Session
++}
++
++/** One job view as the bridge reads it. */
++function job(overrides: Record<string, unknown>): Record<string, unknown> {
++  return { id: 'bash-1', kind: 'bash', label: 'sleep 999', status: 'running', ...overrides }
++}
++
++describe('AIR background-work capability negotiation', () => {
++  it('accepts only a versioned, listed capability', () => {
++    expect(clientSupportsAir(AIR_CAPABILITIES, AIR_ASYNC_TASKS)).toBe(true)
++    expect(clientSupportsAir(AIR_CAPABILITIES, AIR_NATIVE_SUBAGENT_SESSIONS)).toBe(true)
++    expect(clientSupportsAir(AIR_CAPABILITIES, 'diffPatch')).toBe(false)
++    const oldVersion = { _meta: { jetbrains: { air: { version: 0, capabilities: [AIR_ASYNC_TASKS] } } } }
++    const fractionalVersion = { _meta: { jetbrains: { air: { version: 1.5, capabilities: [AIR_ASYNC_TASKS] } } } }
++    const notAList = { _meta: { jetbrains: { air: { version: 1, capabilities: 'asyncTasks' } } } }
++    expect(clientSupportsAir(oldVersion, AIR_ASYNC_TASKS)).toBe(false)
++    expect(clientSupportsAir(fractionalVersion, AIR_ASYNC_TASKS)).toBe(false)
++    expect(clientSupportsAir(notAList, AIR_ASYNC_TASKS)).toBe(false)
++    expect(clientSupportsAir({}, AIR_ASYNC_TASKS)).toBe(false)
++    expect(clientSupportsAir(undefined, AIR_ASYNC_TASKS)).toBe(false)
++  })
++})
++
++describe('draft state mapping', () => {
++  it('maps every harness subagent outcome onto a draft terminal state', () => {
++    expect(subagentStateOf('completed')).toBe('completed')
++    expect(subagentStateOf('aborted')).toBe('cancelled')
++    expect(subagentStateOf('interrupted')).toBe('cancelled')
++    expect(subagentStateOf('max-tokens')).toBe('failed')
++    expect(subagentStateOf('blocked')).toBe('failed')
++    expect(subagentStateOf('error')).toBe('failed')
++    expect(subagentStateOf('something-new')).toBe('disconnected')
++  })
++
++  it('maps a settled job status onto a draft terminal state', () => {
++    expect(asyncTaskStateOf('completed')).toBe('completed')
++    expect(asyncTaskStateOf('killed')).toBe('stopped')
++    expect(asyncTaskStateOf('failed')).toBe('failed')
++    expect(asyncTaskStateOf('running')).toBe('completed')
++  })
++
++  it('wraps a draft update as a session notification', () => {
++    const notification = backgroundWorkNotification('session-1', {
++      sessionUpdate: 'subagent_state_update',
++      subagentSessionId: 'child-1',
++      state: 'completed',
++    })
++    expect(notification).toEqual({
++      sessionId: 'session-1',
++      update: { sessionUpdate: 'subagent_state_update', subagentSessionId: 'child-1', state: 'completed' },
++    })
++  })
++})
++
++describe('background work reporting over the bridge', () => {
++  let harness: BridgeHarness | undefined
++
++  afterEach(async () => {
++    await harness?.dispose()
++    harness = undefined
++  })
++
++  /**
++   * Notifications are asserted on the raw wire, not through the SDK client:
++   * the published SDK's strict schema drops the draft `sessionUpdate` variants
++   * that a raw-frame client like cclaw reads.
++   */
++  const raw = (): { sessionId: string; update: Record<string, unknown> }[] => harness?.rawUpdates ?? []
++
++  async function open(options: { jobs?: boolean; capabilities?: unknown } = {}): Promise<string> {
++    harness = await makeBridgeHarness(options.jobs === true ? { jobs: true } : {})
++    await harness.client.initialize({
++      protocolVersion: PROTOCOL_VERSION,
++      clientCapabilities: options.capabilities ?? AIR_CAPABILITIES,
++    })
++    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
++    return sessionId
++  }
++
++  it('reports a subagent lifecycle to a capable client', async () => {
++    const sessionId = await open()
++
++    emit(harness!.ctx, 'session/created', childSession('child-1', sessionId))
++    await vi.waitFor(() => {
++      expect(raw()).toContainEqual({
++        sessionId,
++        update: {
++          sessionUpdate: 'subagent_spawned',
++          subagentSessionId: 'child-1',
++          name: 'subagent',
++          task: '',
++          capabilities: {},
++        },
++      })
++    })
++
++    emit(harness!.ctx, 'subagent/end', { id: 'child-1', runId: 'run-1', provider: 'spawn', local: true, stopReason: 'completed' })
++    await vi.waitFor(() => {
++      expect(raw()).toContainEqual({
++        sessionId,
++        update: { sessionUpdate: 'subagent_state_update', subagentSessionId: 'child-1', state: 'completed' },
++      })
++    })
++  })
++
++  it('stays silent for a client that did not negotiate the capability', async () => {
++    const sessionId = await open({ capabilities: {} })
++
++    emit(harness!.ctx, 'session/created', childSession('child-9', sessionId))
++    emit(harness!.ctx, 'subagent/end', { id: 'child-9', runId: 'run-9', provider: 'spawn', local: true, stopReason: 'completed' })
++    await new Promise(resolve => setTimeout(resolve, 25))
++
++    expect(raw().some(entry => String(entry.update.sessionUpdate).startsWith('subagent_'))).toBe(false)
++  })
++
++  it('reports a detached job through the job registry', async () => {
++    const sessionId = await open({ jobs: true })
++    expect(harness!.ctx.get('jobs')).toBe(harness!.jobs)
++
++    harness!.jobs!.emit({ type: 'registered', job: job({ owner: sessionId }) })
++    await vi.waitFor(() => {
++      expect(raw()).toContainEqual({
++        sessionId,
++        update: {
++          sessionUpdate: 'async_task_spawned',
++          asyncTaskId: 'bash-1',
++          name: 'sleep 999',
++          taskType: 'bash',
++          description: '',
++          showInTranscript: false,
++          canStop: true,
++        },
++      })
++    })
++
++    harness!.jobs!.emit({ type: 'progress', job: job({ owner: sessionId, progress: '3/10' }) })
++    await vi.waitFor(() => {
++      expect(raw()).toContainEqual({
++        sessionId,
++        update: { sessionUpdate: 'async_task_progress', asyncTaskId: 'bash-1', description: '3/10' },
++      })
++    })
++
++    harness!.jobs!.emit({ type: 'settled', job: job({ owner: sessionId, status: 'completed' }) })
++    await vi.waitFor(() => {
++      expect(raw()).toContainEqual({
++        sessionId,
++        update: { sessionUpdate: 'async_task_state_update', asyncTaskId: 'bash-1', state: 'completed' },
++      })
++    })
++  })
++
++  it('does not double-report a background subagent job', async () => {
++    const sessionId = await open({ jobs: true })
++
++    harness!.jobs!.emit({ type: 'registered', job: job({ owner: sessionId, kind: 'subagent', id: 'subagent-1' }) })
++    await new Promise(resolve => setTimeout(resolve, 25))
++
++    expect(raw().some(entry => entry.update.sessionUpdate === 'async_task_spawned')).toBe(false)
++  })
++
++  it('stops one detached job through the draft extension request', async () => {
++    const sessionId = await open({ jobs: true })
++
++    harness!.jobs!.emit({ type: 'registered', job: job({ owner: sessionId }) })
++    await vi.waitFor(() => {
++      expect(raw().some(entry => entry.update.sessionUpdate === 'async_task_spawned')).toBe(true)
++    })
++
++    await harness!.client.sendExtension('_session/async_task/stop', { sessionId, asyncTaskId: 'bash-1' })
++    expect(harness!.jobs!.killed).toEqual([{ id: 'bash-1', caller: sessionId, reason: 'stopped by ACP client' }])
++  })
++})
+diff --git a/packages/acp/acp/tests/harness.ts b/packages/acp/acp/tests/harness.ts
+index 51d89dab25..2e3442bec2 100644
+--- a/packages/acp/acp/tests/harness.ts
++++ b/packages/acp/acp/tests/harness.ts
+@@ -192,6 +192,8 @@ interface BridgeClient {
+   setSessionConfigOption: NonNullable<AcpAgent['setSessionConfigOption']>
+   prompt: (params: PromptRequest, options?: SendRequestOptions) => Promise<PromptResponse>
+   cancel: NonNullable<AcpAgent['cancel']>
++  /** Send one draft-extension request the published SDK does not type. */
++  sendExtension: (method: string, params: unknown) => Promise<unknown>
+ }
+ 
+ export interface BridgeHarness {
+@@ -201,6 +203,8 @@ export interface BridgeHarness {
+   attachments: MemoryAttachmentStore | undefined
+   updates: CapturedUpdate[]
+   sessionUpdates: { sessionId: string; update: CapturedUpdate }[]
++  /** Every `session/update` notification exactly as it crossed the wire. */
++  rawUpdates: { sessionId: string; update: Record<string, unknown> }[]
+   permissionRequests: RequestPermissionRequest[]
+   persistenceRoot: string
+   onPermission: (request: RequestPermissionRequest) => RequestPermissionResponse
+@@ -209,6 +213,8 @@ export interface BridgeHarness {
+   replacePrimaryProviders: (providers: string[]) => void
+   closeClientTransport: () => Promise<void>
+   abortClientTransport: () => Promise<void>
++  /** The fake `ctx.jobs` the bridge subscribed to, when the harness mounted one. */
++  jobs: FakeJobRegistry | undefined
+   acpFiber: Awaited<ReturnType<Context['plugin']>>
+   /** The AgentLoop fiber, so a test can reload the loop out from under the bridge. */
+   loopFiber: Awaited<ReturnType<Context['plugin']>>
+@@ -217,6 +223,33 @@ export interface BridgeHarness {
+ 
+ type AcpConfigOverrides = { [K in keyof AcpConfig]?: AcpConfig[K] | undefined }
+ 
++/**
++ * Minimal `ctx.jobs` stand-in for the background-work extension tests.
++ *
++ * It owns only what the bridge consumes: the `events` subscription surface and
++ * `kill`. Tests drive it by calling {@link FakeJobRegistry.emit}.
++ */
++export class FakeJobRegistry {
++  readonly killed: { id: string; caller?: string; reason?: string }[] = []
++  private readonly listeners = new Set<(event: unknown) => void>()
++
++  readonly events = {
++    subscribe: (_filter: { owners: 'all' }, listener: (event: unknown) => void): (() => void) => {
++      this.listeners.add(listener)
++      return () => { this.listeners.delete(listener) }
++    },
++  }
++
++  kill(id: string, caller?: string, reason?: string): 'requested' | 'already-finished' {
++    this.killed.push({ id, ...caller === undefined ? {} : { caller }, ...reason === undefined ? {} : { reason } })
++    return 'requested'
++  }
++
++  emit(event: unknown): void {
++    for (const listener of [...this.listeners]) listener(event)
++  }
++}
++
+ /** Build the bridge and a connected SDK client over cross-wired byte streams. */
+ export async function makeBridgeHarness(options: {
+   script?: (StreamChunk[] | 'hang')[]
+@@ -224,6 +257,7 @@ export async function makeBridgeHarness(options: {
+   persona?: string
+   imageCapable?: boolean
+   attachments?: boolean
++  jobs?: boolean
+   persistenceRoot?: string
+ } = {}): Promise<BridgeHarness> {
+   const adapter = new MockAdapter(options.script ?? [], options.imageCapable === true)
+@@ -237,7 +271,34 @@ export async function makeBridgeHarness(options: {
+   const loopFiber = await ctx.plugin(AgentLoop, { agents: [] })
+   const primaryAdapter = ctx.llm.registerAdapter(['mock'], adapter)
+ 
+-  const agentToClient = new TransformStream<Uint8Array, Uint8Array>()
++  /** Every `session/update` notification exactly as it crossed the wire. */
++  const rawUpdates: { sessionId: string; update: Record<string, unknown> }[] = []
++  const wireDecoder = new TextDecoder()
++  let wireBuffer = ''
++  const agentToClient = new TransformStream<Uint8Array, Uint8Array>({
++    transform(chunk, controller) {
++      // Tap before the SDK client: the published SDK's strict schema drops the
++      // draft `sessionUpdate` variants, but a raw-frame client (cclaw) reads
++      // them, so this is the signal that matters.
++      wireBuffer += wireDecoder.decode(chunk, { stream: true })
++      for (let newline = wireBuffer.indexOf('\n'); newline >= 0; newline = wireBuffer.indexOf('\n')) {
++        const line = wireBuffer.slice(0, newline)
++        wireBuffer = wireBuffer.slice(newline + 1)
++        try {
++          const message = JSON.parse(line) as {
++            method?: string
++            params?: { sessionId?: string; update?: Record<string, unknown> }
++          }
++          if (message.method === methods.client.session.update && message.params?.update !== undefined) {
++            rawUpdates.push({ sessionId: String(message.params.sessionId), update: message.params.update })
++          }
++        } catch {
++          // A partial or non-JSON line is not a protocol frame.
++        }
++      }
++      controller.enqueue(chunk)
++    },
++  })
+   const clientToAgent = new TransformStream<Uint8Array, Uint8Array>()
+   const clientToAgentWriter = clientToAgent.writable.getWriter()
+   const clientOutput = new WritableStream<Uint8Array>({
+@@ -249,13 +310,17 @@ export async function makeBridgeHarness(options: {
+   const updates: CapturedUpdate[] = []
+   const sessionUpdates: { sessionId: string; update: CapturedUpdate }[] = []
+   const permissionRequests: RequestPermissionRequest[] = []
++  const jobs = options.jobs === true ? new FakeJobRegistry() : undefined
++  if (jobs !== undefined) ctx.provide('jobs', jobs)
+   const harness: BridgeHarness = {
+     ctx,
+     adapter,
+     attachments: ctx.get('attachments') as MemoryAttachmentStore | undefined,
+     updates,
+     sessionUpdates,
++    rawUpdates,
+     permissionRequests,
++    jobs,
+     persistenceRoot,
+     onPermission: () => ({ outcome: { outcome: 'cancelled' } }),
+     onSessionUpdateError: undefined,
+@@ -304,6 +369,7 @@ export async function makeBridgeHarness(options: {
+     setSessionConfigOption: params => client.request(methods.agent.session.setConfigOption, params),
+     prompt: (params, options) => client.request(methods.agent.session.prompt, params, options),
+     cancel: params => client.notify(methods.agent.session.cancel, params),
++    sendExtension: (method, params) => client.request(method, params),
+   }
+   return harness
+ }
+diff --git a/packages/acp/acp/tsconfig.json b/packages/acp/acp/tsconfig.json
+index ea1239b9f1..beb571564e 100644
+--- a/packages/acp/acp/tsconfig.json
++++ b/packages/acp/acp/tsconfig.json
+@@ -38,6 +38,9 @@
+     {
+       "path": "../../session/session-persistence"
+     },
++    {
++      "path": "../../subagent/subagent"
++    },
+     {
+       "path": "../../interaction/user-approval"
+     }
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 0ee904dcb3..325e1f4850 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -1084,6 +1084,9 @@ importers:
+       '@deepseek-ai/dsh-session-projection':
+         specifier: workspace:*
+         version: link:../../session/session-projection
++      '@deepseek-ai/dsh-subagent':
++        specifier: workspace:*
++        version: link:../../subagent/subagent
+       '@deepseek-ai/dsh-token-meter':
+         specifier: workspace:*
+         version: link:../../llm/token-meter
+@@ -8056,7 +8059,7 @@ importers:
+         version: 11.0.4
+       serve-static:
+         specifier: ^2.2.1
+-        version: 2.2.1(supports-color@9.4.0)
++        version: 2.2.1
+       ws:
+         specifier: ^8.21.0
+         version: 8.21.0
+@@ -10277,7 +10280,7 @@ importers:
+         version: 2.0.0
+       '@modelcontextprotocol/server-everything':
+         specifier: ^2026.7.4
+-        version: 2026.7.4
++        version: 2026.7.4(supports-color@9.4.0)
+       '@modelcontextprotocol/server-filesystem':
+         specifier: ^2026.7.4
+         version: 2026.7.10(zod@4.4.3)
+@@ -23763,8 +23766,8 @@ snapshots:
+       cross-spawn: 7.0.6
+       eventsource: 3.0.7
+       eventsource-parser: 3.1.0
+-      express: 5.2.1
+-      express-rate-limit: 8.5.2(express@5.2.1)
++      express: 5.2.1(supports-color@9.4.0)
++      express-rate-limit: 8.5.2(express@5.2.1(supports-color@9.4.0))
+       hono: 4.12.29
+       jose: 6.2.3
+       json-schema-typed: 8.0.2
+@@ -23775,11 +23778,11 @@ snapshots:
+     transitivePeerDependencies:
+       - supports-color
+ 
+-  '@modelcontextprotocol/server-everything@2026.7.4':
++  '@modelcontextprotocol/server-everything@2026.7.4(supports-color@9.4.0)':
+     dependencies:
+       '@modelcontextprotocol/sdk': 1.29.0(zod@4.4.3)
+       cors: 2.8.6
+-      express: 5.2.1
++      express: 5.2.1(supports-color@9.4.0)
+       jszip: 3.10.1
+       zod: 4.4.3
+     transitivePeerDependencies:
+@@ -25543,7 +25546,7 @@ snapshots:
+ 
+   bluebird@3.7.2: {}
+ 
+-  body-parser@2.3.0:
++  body-parser@2.3.0(supports-color@9.4.0):
+     dependencies:
+       bytes: 3.1.2
+       content-type: 2.1.0
+@@ -26601,15 +26604,15 @@ snapshots:
+ 
+   exponential-backoff@3.1.3: {}
+ 
+-  express-rate-limit@8.5.2(express@5.2.1):
++  express-rate-limit@8.5.2(express@5.2.1(supports-color@9.4.0)):
+     dependencies:
+-      express: 5.2.1
++      express: 5.2.1(supports-color@9.4.0)
+       ip-address: 10.2.0
+ 
+-  express@5.2.1:
++  express@5.2.1(supports-color@9.4.0):
+     dependencies:
+       accepts: 2.0.0
+-      body-parser: 2.3.0
++      body-parser: 2.3.0(supports-color@9.4.0)
+       content-disposition: 1.1.0
+       content-type: 1.0.5
+       cookie: 0.7.2
+@@ -26619,7 +26622,7 @@ snapshots:
+       encodeurl: 2.0.0
+       escape-html: 1.0.3
+       etag: 1.8.1
+-      finalhandler: 2.1.1
++      finalhandler: 2.1.1(supports-color@9.4.0)
+       fresh: 2.0.0
+       http-errors: 2.0.1
+       merge-descriptors: 2.0.0
+@@ -26630,9 +26633,9 @@ snapshots:
+       proxy-addr: 2.0.8
+       qs: 6.15.3
+       range-parser: 1.3.0
+-      router: 2.2.0
+-      send: 1.2.1(supports-color@9.4.0)
+-      serve-static: 2.2.1(supports-color@9.4.0)
++      router: 2.2.0(supports-color@9.4.0)
++      send: 1.2.1
++      serve-static: 2.2.1
+       statuses: 2.0.2
+       type-is: 2.1.0
+       vary: 1.1.2
+@@ -26713,7 +26716,7 @@ snapshots:
+     dependencies:
+       minimatch: 5.1.9
+ 
+-  finalhandler@2.1.1:
++  finalhandler@2.1.1(supports-color@9.4.0):
+     dependencies:
+       debug: 4.4.3(supports-color@9.4.0)
+       encodeurl: 2.0.0
+@@ -28826,7 +28829,7 @@ snapshots:
+       points-on-curve: 0.2.0
+       points-on-path: 0.2.1
+ 
+-  router@2.2.0:
++  router@2.2.0(supports-color@9.4.0):
+     dependencies:
+       debug: 4.4.3(supports-color@9.4.0)
+       depd: 2.0.0
+@@ -28891,7 +28894,7 @@ snapshots:
+ 
+   semver@7.8.5: {}
+ 
+-  send@1.2.1(supports-color@9.4.0):
++  send@1.2.1:
+     dependencies:
+       debug: 4.4.3(supports-color@9.4.0)
+       encodeurl: 2.0.0
+@@ -28912,12 +28915,12 @@ snapshots:
+       type-fest: 0.13.1
+     optional: true
+ 
+-  serve-static@2.2.1(supports-color@9.4.0):
++  serve-static@2.2.1:
+     dependencies:
+       encodeurl: 2.0.0
+       escape-html: 1.0.3
+       parseurl: 1.3.3
+-      send: 1.2.1(supports-color@9.4.0)
++      send: 1.2.1
+     transitivePeerDependencies:
+       - supports-color
+ 
+-- 
+2.54.0 (Apple Git-157)
+
