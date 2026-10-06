@@ -8,8 +8,10 @@
 
 - insert:
     - id: acp-full
-      name: '@chubbyclaw/dsh-acp-full'
+      name: "@chubbyclaw/dsh-acp-full"
       inject: [acpAppStartup]
       config:
         provider: deepseek-official
-        model: deepseek-v4-flash
+        # The catalog id, not upstream's deepseek-v4-flash alias: an id missing
+        # from the harness catalog is treated as text-only, so images are refused.
+        model: deepseek-flash
